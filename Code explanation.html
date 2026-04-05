@@ -1,0 +1,141 @@
+The imports — loading tools you need
+pythonimport os
+import secrets
+os lets Python talk to your operating system — reading files, environment variables. secrets is a Python built-in that generates secure random strings. You use it to create session IDs.
+
+pythonfrom flask import Flask, render_template, request, jsonify, session
+You're importing five specific tools from Flask. Think of Flask as a toolbox — you only take out what you need. Flask creates the app, render_template loads HTML files, request reads data coming from the browser, jsonify sends data back to the browser as JSON, session stores data per user.
+
+pythonfrom anthropic import Anthropic
+Loads the Anthropic library so you can talk to Claude's API.
+
+pythonfrom PyPDF2 import PdfReader
+Loads the PDF reading tool so you can extract text from uploaded PDF files.
+
+pythonfrom dotenv import load_dotenv
+Loads the tool that reads your .env file where your API key lives.
+
+Setting up the app
+pythonload_dotenv()
+Reads your .env file and makes ANTHROPIC_API_KEY available to your code. Must run before anything else that needs the key.
+
+pythonapp = Flask(__name__)
+Creates your web application. __name__ tells Flask where your project folder is so it can find your templates and static files. Everything in your app runs through this app object.
+
+pythonapp.secret_key = secrets.token_hex(24)
+Flask needs a secret key to encrypt session cookies. secrets.token_hex(24) generates a random 48-character string every time the app starts. Sessions won't work without this.
+
+pythonclient = Anthropic()
+Creates your connection to the Anthropic API. It automatically picks up your API key from the .env file because you called load_dotenv() earlier.
+
+The data stores
+pythondocument_store = {}
+conversation_store = {}
+Two empty Python dictionaries that live in server memory. document_store holds uploaded document text. conversation_store holds chat history. Both use the session ID as the key — like a locker number — so each user's data stays separate.
+
+The PDF function
+pythondef extract_text_from_pdf(file):
+    reader = PdfReader(file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() or ""
+    return text
+A reusable function that takes a PDF file as input. PdfReader(file) opens it. reader.pages is a list of every page. The for loop goes through each page and adds its text to the text variable. or "" means if a page has no text, add an empty string instead of crashing. Returns the full text at the end.
+
+The routes — this is the core of Flask
+Think of routes as doors. Each route is a URL address. When the browser knocks on that door, Flask runs the function attached to it.
+
+python@app.route("/")
+def index():
+    session_id = secrets.token_hex(16)
+    session["session_id"] = session_id
+    return render_template("index.html")
+@app.route("/") means — when someone visits the homepage, run the index function. It generates a unique 32-character session ID for this user and stores it in their browser cookie. Then it loads and returns index.html. This is the first thing that runs when someone opens your app.
+
+python@app.route("/upload", methods=["POST"])
+def upload():
+    session_id = session.get("session_id")
+    if not session_id:
+        return jsonify({"error": "Session expired. Please refresh the page."})
+methods=["POST"] means this route only accepts form submissions, not regular page visits. First it checks if the user has a session ID. If not, something went wrong — send back an error message as JSON.
+
+python    text = ""
+
+    if "pdf_file" in request.files and request.files["pdf_file"].filename != "":
+        file = request.files["pdf_file"]
+        if not file.filename.endswith(".pdf"):
+            return jsonify({"error": "Please upload a valid PDF file."})
+        text = extract_text_from_pdf(file)
+
+    elif request.form.get("doc_text", "").strip():
+        text = request.form.get("doc_text", "").strip()
+
+    else:
+        return jsonify({"error": "Please paste text or upload a PDF first."})
+This block figures out where the document came from. request.files contains uploaded files. request.form contains text inputs. It checks for a PDF first — if found, validates it's actually a .pdf then extracts the text. If no PDF, checks for pasted text. If neither, returns an error. strip() removes extra spaces and line breaks.
+
+python    if len(text.strip()) < 50:
+        return jsonify({"error": "Document is too short."})
+
+    document_store[session_id] = text[:20000]
+    conversation_store[session_id] = []
+
+    return jsonify({"success": True, "preview": text[:200] + "..."})
+Validates the document has enough content. Then saves the document text to document_store using the session ID as the key — text[:20000] means take the first 20,000 characters maximum to stay within API limits. Resets conversation history to an empty list. Returns success plus a 200-character preview so the UI can show the user what was loaded.
+
+The chat route — the most important one
+python@app.route("/chat", methods=["POST"])
+def chat():
+    session_id = session.get("session_id")
+    if not session_id or session_id not in document_store:
+        return jsonify({"error": "Please upload a document first."})
+Checks the user has a session AND has already uploaded a document. If not, returns an error. This is why it was saying "upload document first" earlier — the session wasn't persisting.
+
+python    user_message = request.json.get("message", "").strip()
+    if not user_message:
+        return jsonify({"error": "Please type a message."})
+request.json reads the message sent from the browser as JSON — different from request.form which reads HTML form data. Validates the message isn't empty.
+
+python    document = document_store[session_id]
+    messages = conversation_store.get(session_id, [])
+    messages.append({"role": "user", "content": user_message})
+Retrieves this user's document and their conversation history from the server-side dictionaries. Adds the new user message to the conversation history. Each message is a dictionary with a role (user or assistant) and content (the text).
+
+python    system_prompt = f"""You are a helpful assistant that answers questions strictly based on the document provided below.
+Rules:
+- Only answer using information from the document
+- If the answer is not in the document, say "I couldn't find that in the document."
+...
+Document:
+{document}"""
+The system prompt is Claude's instructions — it sets the rules and includes the entire document. This is the heart of RAG. You're literally injecting the document into Claude's context so it can answer questions about it.
+
+python    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        system=system_prompt,
+        messages=messages
+    )
+    assistant_message = response.content[0].text
+Sends everything to Claude — the system prompt (with the document), and the full conversation history (so Claude remembers earlier messages). Gets the response text back.
+
+python    messages.append({"role": "assistant", "content": assistant_message})
+    conversation_store[session_id] = messages
+    return jsonify({"response": assistant_message})
+Adds Claude's response to the conversation history and saves it back to conversation_store. This is how the chatbot remembers previous messages. Returns the response as JSON so the browser JavaScript can display it as a chat bubble.
+
+The reset route
+python@app.route("/reset", methods=["POST"])
+def reset():
+    session_id = session.get("session_id")
+    if session_id:
+        document_store.pop(session_id, None)
+        conversation_store.pop(session_id, None)
+    session.clear()
+    return jsonify({"success": True})
+Cleans up everything when the user clicks "Clear & start over". .pop(session_id, None) removes the entry from the dictionary — the None means don't crash if the key doesn't exist. session.clear() wipes the browser cookie. Clean slate.
+
+The entry point
+pythonif __name__ == "__main__":
+    app.run(debug=True)
+if __name__ == "__main__" means — only run this if you're executing this file directly (not importing it from somewhere else). app.run(debug=True) starts the web server. debug=True auto-restarts when you change code and shows detailed error messages.

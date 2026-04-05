@@ -1,4 +1,5 @@
 import os
+import secrets
 from flask import Flask, render_template, request, jsonify, session
 from anthropic import Anthropic
 from PyPDF2 import PdfReader
@@ -7,8 +8,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = "your-secret-key-change-this"
+app.secret_key = secrets.token_hex(24)
 client = Anthropic()
+
+document_store = {}
+conversation_store = {}
 
 def extract_text_from_pdf(file):
     reader = PdfReader(file)
@@ -19,11 +23,16 @@ def extract_text_from_pdf(file):
 
 @app.route("/")
 def index():
-    session.clear()
+    session_id = secrets.token_hex(16)
+    session["session_id"] = session_id
     return render_template("index.html")
 
 @app.route("/upload", methods=["POST"])
 def upload():
+    session_id = session.get("session_id")
+    if not session_id:
+        return jsonify({"error": "Session expired. Please refresh the page."})
+
     text = ""
 
     if "pdf_file" in request.files and request.files["pdf_file"].filename != "":
@@ -41,25 +50,28 @@ def upload():
     if len(text.strip()) < 50:
         return jsonify({"error": "Document is too short. Please provide more content."})
 
-    session["document"] = text[:20000]
-    session["messages"] = []
+    document_store[session_id] = text[:20000]
+    conversation_store[session_id] = []
+
+    print(f"Document saved for session {session_id}, length: {len(text)}")
     return jsonify({"success": True, "preview": text[:200] + "..."})
 
 @app.route("/chat", methods=["POST"])
 def chat():
-    if "document" not in session:
+    session_id = session.get("session_id")
+    if not session_id or session_id not in document_store:
         return jsonify({"error": "Please upload a document first."})
 
     user_message = request.json.get("message", "").strip()
     if not user_message:
         return jsonify({"error": "Please type a message."})
 
-    document = session["document"]
-    messages = session.get("messages", [])
+    document = document_store[session_id]
+    messages = conversation_store.get(session_id, [])
 
     messages.append({"role": "user", "content": user_message})
 
-    system_prompt = f"""You are a helpful assistant that answers questions strictly based on the document provided below. 
+    system_prompt = f"""You are a helpful assistant that answers questions strictly based on the document provided below.
 
 Rules:
 - Only answer using information from the document
@@ -79,12 +91,16 @@ Document:
 
     assistant_message = response.content[0].text
     messages.append({"role": "assistant", "content": assistant_message})
-    session["messages"] = messages
+    conversation_store[session_id] = messages
 
     return jsonify({"response": assistant_message})
 
 @app.route("/reset", methods=["POST"])
 def reset():
+    session_id = session.get("session_id")
+    if session_id:
+        document_store.pop(session_id, None)
+        conversation_store.pop(session_id, None)
     session.clear()
     return jsonify({"success": True})
 
