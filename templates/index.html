@@ -176,6 +176,7 @@
         document.getElementById('status').innerText = 'Document ready';
         document.getElementById('doc-preview').style.display = 'block';
         document.getElementById('doc-preview').innerText = data.preview;
+        document.getElementById('doc-preview').innerText += `\n\n✓ Split into ${data.chunks} searchable chunks`;
         document.getElementById('btn-reset').style.display = 'block';
         document.getElementById('btn-send').disabled = false;
         btn.innerText = 'Document loaded';
